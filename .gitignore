@@ -1,0 +1,6 @@
+# External inputs are downloaded, never redistributed (SAD must stay encrypted; Jordine repo has no license)
+data/external/
+# Activations are large and regenerable
+results/activations/
+__pycache__/
+*.pyc
