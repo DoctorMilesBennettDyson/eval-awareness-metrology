@@ -227,11 +227,15 @@ def main():
     torch.manual_seed(20260915)
 
     t_load = time.time()
-    tok = AutoTokenizer.from_pretrained(hf_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        hf_id, dtype=torch.bfloat16, device_map="auto",
-        max_memory={0: f"{args.gpu_gib}GiB", "cpu": f"{args.cpu_gib}GiB"},
-        offload_folder=str(OFFLOAD_DIR))
+    load_kw = dict(dtype=torch.bfloat16, device_map="auto",
+                   max_memory={0: f"{args.gpu_gib}GiB", "cpu": f"{args.cpu_gib}GiB"},
+                   offload_folder=str(OFFLOAD_DIR))
+    try:  # Windows without symlinks: online resolution can re-download files already in the snapshot
+        tok = AutoTokenizer.from_pretrained(hf_id, local_files_only=True)
+        model = AutoModelForCausalLM.from_pretrained(hf_id, local_files_only=True, **load_kw)
+    except OSError:
+        tok = AutoTokenizer.from_pretrained(hf_id)
+        model = AutoModelForCausalLM.from_pretrained(hf_id, **load_kw)
     model.eval()
     if getattr(model.config, "pad_token_id", None) is None:
         model.config.pad_token_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
@@ -251,17 +255,18 @@ def main():
             "attn_impl": getattr(model.config, "_attn_implementation", None),
             "transformers": __import__("transformers").__version__, "torch": torch.__version__,
             "load_seconds": t_load, "timings": {}}
-    try:
-        from huggingface_hub import HfApi
-        info = HfApi().model_info(hf_id, files_metadata=True)
-        meta["revision"] = info.sha
-        meta["weights_sha256"] = {s.rfilename: s.lfs.sha256 for s in info.siblings
-                                  if s.lfs is not None and s.rfilename.endswith(".safetensors")}
-    except Exception as e:  # metadata only; never blocks extraction
-        meta["weights_sha256_error"] = repr(e)
+    weights_meta(hf_id, meta)
 
-    sets = set(args.sets.split(","))
+    for s in build_sets(tok, set(args.sets.split(",")), out_dir, meta):
+        meta["timings"][s["name"]] = extract_set(ex, s["name"], s["ids"], s["spec"], s["out"], L, d,
+                                                 args.token_budget, args.max_batch, last_path=s["last"])
+    write_meta_and_done(out_dir, meta)
+    print(f"{args.model}: done  {meta['timings']}", flush=True)
 
+
+def build_sets(tok, sets, out_dir, meta):
+    """Token ids and reduction specs for every prompt set (prereg §5-§6). Fills per-set metadata into `meta`."""
+    out = []
     if "d1" in sets:
         d1 = load_d1()
         pos_ids, pos_spec, neg_ids, neg_spec, fallbacks = [], [], [], [], 0
@@ -273,10 +278,8 @@ def main():
                 ids_l.append(ids)
                 spec_l.append(("pos", p))
         meta["d1"] = {"n": len(d1), "letter_fallbacks": fallbacks}
-        meta["timings"]["d1_pos"] = extract_set(ex, "d1_pos", pos_ids, pos_spec, out_dir / "d1_pos.npy", L, d,
-                                                args.token_budget, args.max_batch)
-        meta["timings"]["d1_neg"] = extract_set(ex, "d1_neg", neg_ids, neg_spec, out_dir / "d1_neg.npy", L, d,
-                                                args.token_budget, args.max_batch)
+        out.append({"name": "d1_pos", "ids": pos_ids, "spec": pos_spec, "out": out_dir / "d1_pos.npy", "last": None})
+        out.append({"name": "d1_neg", "ids": neg_ids, "spec": neg_spec, "out": out_dir / "d1_neg.npy", "last": None})
 
     if "d2" in sets:
         d2 = load_d2()
@@ -296,8 +299,8 @@ def main():
         meta["d2"] = {"n": len(d2), "labels": [it["label"] for it in d2], "nchar": [it["nchar"] for it in d2],
                       "ntok": ntok, "n_weighted_tok": nw, "truncated": truncated, "system_merged": merged}
         # d2_last.npy (last prompt token) is for the exploratory transfer test registered in prereg §15
-        meta["timings"]["d2"] = extract_set(ex, "d2", ids_list, spec, out_dir / "d2_mean.npy", L, d,
-                                            args.token_budget, args.max_batch, last_path=out_dir / "d2_last.npy")
+        out.append({"name": "d2", "ids": ids_list, "spec": spec, "out": out_dir / "d2_mean.npy",
+                    "last": out_dir / "d2_last.npy"})
 
     if "d3" in sets:
         d3 = load_d3()
@@ -314,9 +317,22 @@ def main():
         meta["d3"] = {"n": len(d3), "cell": [r["cell"] for r in d3], "split": [r["split"] for r in d3],
                       "is_eval": [r["is_eval"] for r in d3], "is_bench": [r["is_bench"] for r in d3],
                       "nchar": [r["nchar"] for r in d3], "ntok": ntok, "truncated": truncated}
-        meta["timings"]["d3"] = extract_set(ex, "d3", ids_list, spec, out_dir / "d3_last.npy", L, d,
-                                            args.token_budget, args.max_batch)
+        out.append({"name": "d3", "ids": ids_list, "spec": spec, "out": out_dir / "d3_last.npy", "last": None})
+    return out
 
+
+def weights_meta(hf_id, meta):
+    try:
+        from huggingface_hub import HfApi
+        info = HfApi().model_info(hf_id, files_metadata=True)
+        meta["revision"] = info.sha
+        meta["weights_sha256"] = {s.rfilename: s.lfs.sha256 for s in info.siblings
+                                  if s.lfs is not None and s.rfilename.endswith(".safetensors")}
+    except Exception as e:  # metadata only; never blocks extraction
+        meta["weights_sha256_error"] = repr(e)
+
+
+def write_meta_and_done(out_dir, meta):
     meta_path = out_dir / "meta.json"
     if meta_path.exists():  # partial re-runs (--sets) must not drop metadata of sets not re-extracted
         old = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -326,7 +342,6 @@ def main():
         meta = old
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
     (out_dir / "DONE").write_text(time.strftime("%Y-%m-%dT%H:%M:%S"), encoding="utf-8")
-    print(f"{args.model}: done  {meta['timings']}", flush=True)
 
 
 if __name__ == "__main__":

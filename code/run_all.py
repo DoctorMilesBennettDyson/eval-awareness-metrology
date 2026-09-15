@@ -61,7 +61,11 @@ def main():
         done = ROOT / "results" / "activations" / key / "DONE"
         log = LOGS / f"{key}.log"
         if not done.exists():
-            rc = run([PY, "extract.py", "--model", key] + args.extract_args.split(), log)
+            cmd = [PY, "extract_lw.py", "--model", key] + args.extract_args.split()
+            ref = ROOT / "results" / "reference_standard_path" / key
+            if ref.exists():
+                cmd += ["--validate", str(ref)]
+            rc = run(cmd, log)
             if rc != 0:
                 print(f"{key}: extraction FAILED (rc={rc}), see {log}", flush=True)
                 continue
