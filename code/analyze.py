@@ -379,7 +379,7 @@ def aggregate():
                  "ci95": [float(np.quantile(diff, 0.025)), float(np.quantile(diff, 0.975))],
                  "E_corr2x2_values": col("E_corr2x2").tolist(),
                  "ceiling_models": int((col("E_corr2x2") >= 0.49).sum()),
-                 "caveat": "PAIRED is trained on CE and BD; E_corr2x2 may sit at ceiling (prereg §15, 2026-09-15 00:20)"}
+                 "caveat": "PAIRED is trained on CE and BD; E_corr2x2 may sit at ceiling (prereg §15, commit 839bc4d)"}
     rep["H4"]["confirmed_bonferroni"] = bool(d0 > 0 and rep["H4"]["ci9833"][0] > 0)
     rep["H4"]["confirmed_uncorrected"] = bool(d0 > 0 and rep["H4"]["ci95"][0] > 0)
     sn = S["E_naive2x2"]["slope_per_decade"]
