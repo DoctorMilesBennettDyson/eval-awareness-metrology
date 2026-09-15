@@ -228,6 +228,16 @@ def per_model(key):
         res[f"{p}_crossed_auc_layers"] = auroc_from_scores(S[p]["test"][mt_cross], y_eval[ev["test"]][mt_cross]).tolist()
         res[f"{p}_all_auc_layers"] = auroc_from_scores(S[p]["test"], y_eval[ev["test"]]).tolist()
 
+    # EXPLORATORY (prereg §15, 2026-09-15): 2x2-trained probes transferred to SAD at the last prompt token.
+    # Layer chosen on 2x2 validation (same layers as H3 / E_corr2x2), so no selection on SAD.
+    if (d / "d2_last.npy").exists():
+        d2l = np.load(d / "d2_last.npy", mmap_mode="r")
+        for p, l_sel in (("STD", res["std_valsel_layer"]), ("PAIRED", res["paired_valsel_layer"]), ("FORMAT", None)):
+            a = auroc_from_scores(project(d2l, probes[p]), y2)
+            res[f"expl_sad_transfer_{p}_auc_layers"] = a.tolist()
+            if l_sel is not None:
+                res[f"expl_sad_transfer_{p}_auc_valsel"] = float(a[l_sel])
+
     ntok3 = np.array(meta["d3"]["ntok"], dtype=float)
     tr = ntok3[ev["test"]]
     res["2x2_B1_ntok_crossed_auc"] = float(auroc_from_scores(tr[mt_cross], y_eval[ev["test"]][mt_cross]))

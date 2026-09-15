@@ -6,6 +6,7 @@
 Outputs to results/activations/<key>/ :
     d1_pos.npy, d1_neg.npy   (204, L, d)  resid_pre at the answer-letter token (P-SAD vector)
     d2_mean.npy              (400, L, d)  token-mean resid_pre over non-BOS, non-whitespace tokens (P-SAD scores)
+    d2_last.npy              (400, L, d)  resid_pre at the last prompt token (exploratory transfer test, prereg §15)
     d3_last.npy              (4063, L, d) resid_pre at the last prompt token (2x2 probes)
     meta.json                labels/cells/splits/lengths, model metadata, weight SHA-256s, timings
 
@@ -126,7 +127,9 @@ class Extractor:
 
     @torch.no_grad()
     def run(self, batch_ids, spec):
-        """batch_ids: list of token lists (right padded here). spec: ('pos', [idx]) or ('wmean', [weights])."""
+        """batch_ids: list of token lists (right padded here).
+        spec: ('pos', [idx]) -> (B, L, d); ('wmean', [weights]) -> (B, L, d);
+              ('wmean+last', [weights]) -> (B, L, 2, d) with [..., 0, :] token-mean and [..., 1, :] last token."""
         device = self.model.get_input_embeddings().weight.device
         T = max(len(x) for x in batch_ids)
         pad = self.model.config.pad_token_id if getattr(self.model.config, "pad_token_id", None) is not None else 0
@@ -146,9 +149,15 @@ class Extractor:
             for b, ws in enumerate(payload):
                 w[b, :len(ws)] = torch.tensor(ws)
 
+            last = torch.tensor([len(x) - 1 for x in batch_ids], dtype=torch.long)
+
             def reduce(h):
                 ww = w.to(h.device)
-                return (h.float() * ww[..., None]).sum(1) / ww.sum(1, keepdim=True).clamp_min(1.0)
+                mean = (h.float() * ww[..., None]).sum(1) / ww.sum(1, keepdim=True).clamp_min(1.0)
+                if kind == "wmean":
+                    return mean
+                lt = h[torch.arange(h.shape[0], device=h.device), last.to(h.device)].float()
+                return torch.stack([mean, lt], dim=1)
         self.reduce = reduce
         try:
             self.model(input_ids=ids.to(device), attention_mask=mask.to(device), use_cache=False, logits_to_keep=1)
@@ -171,21 +180,31 @@ def batches(lengths, token_budget, max_batch):
         yield cur
 
 
-def extract_set(ex, name, ids_list, spec_list, out_path, L, d, token_budget, max_batch):
+def extract_set(ex, name, ids_list, spec_list, out_path, L, d, token_budget, max_batch, last_path=None):
     N = len(ids_list)
     arr = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float32, shape=(N, L, d))
+    arr_last = (np.lib.format.open_memmap(last_path, mode="w+", dtype=np.float32, shape=(N, L, d))
+                if last_path is not None else None)
     lengths = np.array([len(x) for x in ids_list])
     t0 = time.time()
     done = 0
     for bidx in batches(lengths, token_budget, max_batch):
         kind = spec_list[0][0]
         spec = (kind, [spec_list[i][1] for i in bidx])
-        arr[bidx] = ex.run([ids_list[i] for i in bidx], spec)
+        res = ex.run([ids_list[i] for i in bidx], spec)
+        if kind == "wmean+last":
+            arr[bidx] = res[:, :, 0, :]
+            arr_last[bidx] = res[:, :, 1, :]
+        else:
+            arr[bidx] = res
         done += len(bidx)
         if done % 256 < len(bidx):
             print(f"  {name}: {done}/{N}  {time.time() - t0:.0f}s", flush=True)
     arr.flush()
     del arr
+    if arr_last is not None:
+        arr_last.flush()
+        del arr_last
     return time.time() - t0
 
 
@@ -221,7 +240,8 @@ def main():
     layers_name, layers = find_decoder_layers(model, L)
     ex = Extractor(model, list(layers))
     device_map = getattr(model, "hf_device_map", {})
-    placement = {str(v): sum(1 for x in device_map.values() if x == v) for v in set(device_map.values())}
+    placement = ({str(v): sum(1 for x in device_map.values() if x == v) for v in set(device_map.values())}
+                 or {str(model.device): "all"})
     t_load = time.time() - t_load
     print(f"{args.model}: L={L} d={d} layers={layers_name} placement={placement} load={t_load:.0f}s", flush=True)
 
@@ -270,13 +290,14 @@ def main():
                 truncated += 1
             w = token_mean_weights(tok, ids)
             ids_list.append(ids)
-            spec.append(("wmean", w))
+            spec.append(("wmean+last", w))
             ntok.append(len(ids))
             nw.append(int(sum(w)))
         meta["d2"] = {"n": len(d2), "labels": [it["label"] for it in d2], "nchar": [it["nchar"] for it in d2],
                       "ntok": ntok, "n_weighted_tok": nw, "truncated": truncated, "system_merged": merged}
+        # d2_last.npy (last prompt token) is for the exploratory transfer test registered in prereg §15
         meta["timings"]["d2"] = extract_set(ex, "d2", ids_list, spec, out_dir / "d2_mean.npy", L, d,
-                                            args.token_budget, args.max_batch)
+                                            args.token_budget, args.max_batch, last_path=out_dir / "d2_last.npy")
 
     if "d3" in sets:
         d3 = load_d3()
@@ -296,7 +317,14 @@ def main():
         meta["timings"]["d3"] = extract_set(ex, "d3", ids_list, spec, out_dir / "d3_last.npy", L, d,
                                             args.token_budget, args.max_batch)
 
-    (out_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    meta_path = out_dir / "meta.json"
+    if meta_path.exists():  # partial re-runs (--sets) must not drop metadata of sets not re-extracted
+        old = json.loads(meta_path.read_text(encoding="utf-8"))
+        old_t = old.get("timings", {})
+        old.update({k: v for k, v in meta.items() if k != "timings"})
+        old["timings"] = {**old_t, **meta["timings"]}
+        meta = old
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
     (out_dir / "DONE").write_text(time.strftime("%Y-%m-%dT%H:%M:%S"), encoding="utf-8")
     print(f"{args.model}: done  {meta['timings']}", flush=True)
 
