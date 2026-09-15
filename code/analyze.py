@@ -288,18 +288,132 @@ def text_baselines(seed=SEED):
     return out
 
 
+# ----------------------------------------------------------------------------- aggregate (prereg §9)
+CONFIRMATORY = ["smollm2-135m", "smollm2-360m", "smollm2-1.7b", "qwen2.5-0.5b", "qwen2.5-1.5b", "qwen2.5-3b",
+                "qwen2.5-7b", "qwen2.5-14b", "gemma3-270m", "gemma3-1b", "gemma3-4b", "gemma3-12b",
+                "llama3.2-1b", "llama3.2-3b", "llama3.1-8b"]
+
+
+def fe_design(logn, fam, extra=None):
+    fams = sorted(set(fam))
+    cols = [logn] + ([extra] if extra is not None else []) + [(np.array(fam) == f).astype(float) for f in fams]
+    return np.column_stack(cols)
+
+
+def fe_slope(y, logn, fam, extra=None):
+    X = fe_design(logn, fam, extra)
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    return beta
+
+
+def summarize_slope(name, y, boot, logn, fam):
+    """Point slope, percentile CIs (95%, 98.33%), leave-one-model-out jackknife."""
+    s = float(fe_slope(y, logn, fam)[0])
+    out = {"estimator": name, "slope_per_decade": s}
+    if boot is not None:
+        bs = np.array([fe_slope(boot[:, b], logn, fam)[0] for b in range(boot.shape[1])])
+        out["ci95"] = [float(np.quantile(bs, 0.025)), float(np.quantile(bs, 0.975))]
+        out["ci9833"] = [float(np.quantile(bs, 0.00835)), float(np.quantile(bs, 0.99165))]
+        out["boot_slopes"] = bs
+    jk = np.array([fe_slope(y[m], logn[m], list(np.array(fam)[m]))[0]
+                   for m in (np.arange(len(y)) != i for i in range(len(y)))])
+    out["jackknife_min_max"] = [float(jk.min()), float(jk.max())]
+    out["jackknife_se"] = float(np.sqrt((len(jk) - 1) / len(jk) * ((jk - jk.mean()) ** 2).sum()))
+    return out
+
+
+def aggregate():
+    from scipy.stats import spearmanr
+    rows, boots = [], []
+    missing = [k for k in CONFIRMATORY if not (OUT / f"{k}.json").exists()]
+    for k in CONFIRMATORY:
+        if (OUT / f"{k}.json").exists():
+            rows.append(json.loads((OUT / f"{k}.json").read_text(encoding="utf-8")))
+            boots.append(dict(np.load(OUT / f"{k}_boot.npz")))
+    fam = [r["family"] for r in rows]
+    logn = np.log10([r["nominal_B"] * 1e9 for r in rows])
+    L = np.array([r["n_layers"] for r in rows], dtype=float)
+    col = lambda key: np.array([r[key] for r in rows], dtype=float)
+    bcol = lambda key: np.stack([b[key] for b in boots])  # (models, B)
+
+    rep = {"models_analysed": [r["key"] for r in rows], "models_missing": missing, "n_models": len(rows)}
+
+    # H1a / H1b
+    n1 = col("sad_N1_mean")
+    rep["H1a"] = {"min_N1_mean": float(n1.min()), "argmin": rows[int(n1.argmin())]["key"],
+                  "confirmed": bool(n1.min() >= 0.02)}
+    rho = spearmanr(n1, L).statistic
+    rng = np.random.default_rng(SEED)
+    perm = np.array([spearmanr(n1, rng.permutation(L)).statistic for _ in range(10000)])
+    p_h1b = float((1 + (perm >= rho).sum()) / (1 + len(perm)))
+    rep["H1b"] = {"spearman_rho": float(rho), "p_one_sided": p_h1b,
+                  "confirmed_bonferroni": bool(rho > 0 and p_h1b < 0.05 / 3), "confirmed_uncorrected": bool(rho > 0 and p_h1b < 0.05)}
+
+    # slopes
+    S = {}
+    for name, key, has_boot in (("sad_E_naive", "sad_E_naive", True), ("sad_E_split", "sad_E_split", True),
+                                ("sad_E_fixed", "sad_E_fixed", False), ("sad_E_naive_no_l0", "sad_E_naive_no_l0", False),
+                                ("E_naive2x2", "E_naive2x2", True), ("E_corr2x2", "E_corr2x2", True),
+                                ("std_crossed_auc_valsel", "std_crossed_auc_valsel", True)):
+        S[name] = summarize_slope(name, col(key), bcol(key) if has_boot else None, logn, fam)
+    # E_corr on SAD: E_naive bootstrap minus fixed N1 mean
+    S["sad_E_corr"] = summarize_slope("sad_E_corr", col("sad_E_corr"), bcol("sad_E_naive") - n1[:, None], logn, fam)
+    for p in ("STD", "PAIRED"):
+        k = f"expl_sad_transfer_{p}_auc_valsel"
+        if all(k in r for r in rows):
+            S[f"EXPLORATORY_{k}"] = summarize_slope(k, col(k), None, logn, fam)
+
+    def ci_excl0(d, lvl):
+        lo, hi = d[lvl]
+        return bool(lo > 0 or hi < 0)
+
+    rep["H2"] = {"slope": S["sad_E_naive"]["slope_per_decade"], "ci9833": S["sad_E_naive"]["ci9833"],
+                 "ci95": S["sad_E_naive"]["ci95"],
+                 "confirmed_bonferroni": bool(S["sad_E_naive"]["slope_per_decade"] > 0 and S["sad_E_naive"]["ci9833"][0] > 0),
+                 "confirmed_uncorrected": bool(S["sad_E_naive"]["slope_per_decade"] > 0 and S["sad_E_naive"]["ci95"][0] > 0)}
+    frac = float((col("std_crossed_auc_valsel") < 0.5).mean())
+    rep["H3"] = {"fraction_models_crossed_below_0.5": frac, "confirmed": bool(frac >= 0.8)}
+    diff = S["E_naive2x2"]["boot_slopes"] - S["E_corr2x2"]["boot_slopes"]
+    d0 = S["E_naive2x2"]["slope_per_decade"] - S["E_corr2x2"]["slope_per_decade"]
+    rep["H4"] = {"slope_diff": float(d0), "ci9833": [float(np.quantile(diff, 0.00835)), float(np.quantile(diff, 0.99165))],
+                 "ci95": [float(np.quantile(diff, 0.025)), float(np.quantile(diff, 0.975))],
+                 "E_corr2x2_values": col("E_corr2x2").tolist(),
+                 "ceiling_models": int((col("E_corr2x2") >= 0.49).sum()),
+                 "caveat": "PAIRED is trained on CE and BD; E_corr2x2 may sit at ceiling (prereg §15, 2026-09-15 00:20)"}
+    rep["H4"]["confirmed_bonferroni"] = bool(d0 > 0 and rep["H4"]["ci9833"][0] > 0)
+    rep["H4"]["confirmed_uncorrected"] = bool(d0 > 0 and rep["H4"]["ci95"][0] > 0)
+    sn = S["E_naive2x2"]["slope_per_decade"]
+    rep["H5"] = {"slope_E_corr2x2": S["E_corr2x2"]["slope_per_decade"], "ci95": S["E_corr2x2"]["ci95"],
+                 "ratio_corr_over_naive": float(S["E_corr2x2"]["slope_per_decade"] / sn) if sn != 0 else None}
+    b6 = fe_slope(col("sad_E_naive"), logn, fam, extra=np.log10(L))
+    rep["H6"] = {"coef_log10N": float(b6[0]), "coef_log10L": float(b6[1]),
+                 "smollm2": [{"key": r["key"], "L": r["n_layers"], "N_B": r["nominal_B"], "E_naive": r["sad_E_naive"],
+                              "N1_mean": r["sad_N1_mean"]} for r in rows if r["family"] == "SmolLM2"]}
+    rep["slopes"] = {k: {kk: vv for kk, vv in v.items() if kk != "boot_slopes"} for k, v in S.items()}
+    rep["per_model"] = [{k: v for k, v in r.items() if not isinstance(v, list)} for r in rows]
+    tb = OUT / "text_baselines.json"
+    if tb.exists():
+        rep["text_baselines"] = json.loads(tb.read_text(encoding="utf-8"))
+    (OUT / "AGGREGATE.json").write_text(json.dumps(rep, indent=1), encoding="utf-8")
+    return rep
+
+
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
     p1 = sp.add_parser("per-model")
     p1.add_argument("--model", required=True)
     sp.add_parser("text-baselines")
+    sp.add_parser("aggregate")
     args = ap.parse_args()
     if args.cmd == "per-model":
         r = per_model(args.model)
         print(json.dumps({k: v for k, v in r.items() if not isinstance(v, list)}, indent=1))
     elif args.cmd == "text-baselines":
         print(json.dumps(text_baselines(), indent=1))
+    elif args.cmd == "aggregate":
+        r = aggregate()
+        print(json.dumps({k: v for k, v in r.items() if k not in ("per_model", "slopes")}, indent=1))
 
 
 if __name__ == "__main__":
